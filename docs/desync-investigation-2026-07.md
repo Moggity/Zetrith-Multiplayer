@@ -57,6 +57,55 @@ The trace diff caught this one because the read-back happens to consume RNG; a g
 altered, say, a stack count would surface thousands of ticks later, anywhere. Hence: state
 hashing.
 
+---
+
+## Evidence across the last 10 desyncs (Desync-93…101 + 102)
+
+Session facts: local client (MoggCareta) plays **English**, host (Buh0) plays **Latin American
+Spanish**. Local-vs-host trace diff of every archive:
+
+| # | Stream | First divergent call (side with the extra/differing draw) |
+|---|---|---|
+| 93 | map 0 | **L extra**: `CheckChangePawnKindName → GeneratePawnName` on `Cow156958` |
+| 94 | map 0 | **L extra**: `CheckChangePawnKindName → GeneratePawnName` on `Dromedary155654` |
+| 95 | map 0 | Same pawn `Human64321`, **identical RNG state at entry**: L starts `WorkGiver_DoBill` job, H starts `WorkGiver_CleanFilth` job |
+| 96 | map 0 | identical signature to 95 |
+| 97 | map 0 | identical signature to 95 |
+| 98 | world | **H extra**: `CheckChangePawnKindName → GeneratePawnName` on `Dromedary155654` |
+| 99 | world | Ideo generation diverges: L `Precept_Building.Init → GetNextPresenceDemandID` vs H `Precept_ThingStyle.GenerateNameRaw → GrammarResolver`; trace counts L=13 675 vs H=30 426 |
+| 100 | map 0 | L `Thing.PostMake → GetNextThingID` vs H `Pawn_FilthTracker.Notify_EnteredNewCell` — filth/thing state already diverged |
+| 101 | world | Ideo generation diverges: L `Precept_Ritual.GenerateNameRaw → GrammarResolver` vs H `Precept.Init → GetNextPreceptID` |
+| 102 | (map) | **H extra**: `CheckChangePawnKindName → GeneratePawnName` on `Cow156958` |
+
+Two classes emerge:
+
+**Class A — language-data-dependent simulation: 6 of 10 (93, 94, 98, 99, 101, 102).**
+Four animal renames (same two animals recurring, in *both* directions — the rename ping-pongs
+because every rejoin restores the host's name strings, re-arming the mismatch) and two **ideo
+precept generation** divergences. The ideo cases are the severe form: `Precept.GenerateNewName`
+resolves grammar with retry-until-acceptable loops over *translated* rule packs, so different
+language data produces different numbers of draws **and different `UniqueIDsManager` ID
+allocations** (`GetNextPreceptID`, `GetNextPresenceDemandID` visibly interleave differently).
+Diverged unique-ID counters shift every subsequently created object's ID — persistent,
+compounding, and **not cosmetic**.
+
+**Class B — latent state divergence surfacing in job selection: 4 of 10 (95, 96, 97, 100).**
+The RNG streams are *identical* at the divergence point; the same pawn simply picks a different
+job on each side (`DoBill` vs `CleanFilth`), i.e. a non-RNG simulation input (filth present,
+ingredient/stack availability, work-relevant ideo state) already differed. Trace diffing is
+**structurally blind** to the origin of these — this is precisely the class only state hashing
+can attribute. Candidate origins: downstream of Class A's ideo/ID divergence, stack-state
+divergence (OgreStack settings live in local config files), or an as-yet-unknown source.
+
+**On "we switched the client to Spanish and it desynced more":** consistent with the model.
+English is compiled into the game build — byte-identical on both machines by construction.
+LatAm Spanish is a community-maintained pack that updates independently; two installs easily
+carry different versions (the client's older logs showed *"35 errors"* in that pack), so "same
+language" still means different label data — while the save's existing English-generated names
+now mismatch labels on *both* sides, arming more renames. The controlled experiment is **both
+players on English**: Class A incidents should disappear; whatever remains is pure Class B and
+prime hasher input.
+
 > Immediate corollary (small, separate from the hasher work): MP should patch
 > `Pawn_AgeTracker.CheckChangePawnKindName` to isolate it (`Rand.PushState/PopState` around the
 > original, so the conditional rename consumes zero main-stream draws on either side). Names are
@@ -129,6 +178,12 @@ before the desync even fired. And the registry doubles as a **hit-list of vanill
 never read cosmetic state into simulation decisions** — each entry is a place needing a
 `CheckChangePawnKindName`-style isolation patch.
 
+Important boundary drawn by the Desync-99/101 evidence: language divergence is only cosmetic
+while it stays in strings. The ideo-generation cases show it leaking into **unique-ID
+allocation**, which is sim-critical state — the hasher must keep `UniqueIDsManager` counters in
+the sim channel (they are cheap, high-signal leaves: a counter mismatch immediately flags "object
+creation diverged, and everything created afterwards is suspect").
+
 ### 4. Exchange & drill-down protocol
 
 - Every N ticks (hunt mode: ~600; always-on mode later: ~2500), each client computes the tree
@@ -177,7 +232,7 @@ Integrations: `ClientSyncOpinion` (roots + serialization), `SyncCoordinator` (co
 | M2 | Roots in `ClientSyncOpinion` + comparison in `SyncCoordinator`, hunt-mode setting | Two clients in sync report equal roots for 100k+ ticks; a dev-mode injected state mutation on one side trips the root within one window. |
 | M3 | Drill-down protocol + `state_diff.txt` | Injected mutation is pinpointed to the exact thing and field in the desync zip without human digging. |
 | M4 | Cosmetic channel + exclusion registry | Cross-language session (host English, client Spanish) runs with **zero false sim-channel trips**, while the cosmetic report lists the name-string divergences. |
-| M5 | Acceptance test on the real bug | Reproduce Desync102's scenario (aging numeric-named animal, different languages): hasher must name the pawn's `name` field *before* the RNG desync fires. Ship the `CheckChangePawnKindName` isolation patch; hasher confirms sessions stay clean after it. |
+| M5 | Acceptance tests on the real bugs | (a) Class A: aging numeric-named animal, different languages — hasher names the pawn's `name` field *before* the RNG desync fires; (b) Class A severe: mid-game ideo generation under different languages — hasher flags `UniqueIDsManager` counters within one window; (c) Class B: reproduce the players' `DoBill` vs `CleanFilth` divergence — hasher names the diverged filth/stack/ideo state that trace diffing cannot attribute. Ship the `CheckChangePawnKindName` isolation patch; hasher confirms sessions stay clean after it. |
 
 ## Risks / open questions
 
