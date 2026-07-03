@@ -1,215 +1,194 @@
-# Desync investigation: recurring "Wrong random state on map 0" + rejoin desync loop
+# Desync root-cause identification via Merkle state hashing
 
-Report based on a non-host client log (`local_logs.txt`, player `MoggCareta`) and the host's
-random-state traces (`host_traces.txt`, host faction `Buh0's faction`).
+Focus of this document (per investigation decision): build **hierarchical (Merkle) game-state
+hashing** into Multiplayer as the primary root-cause identification tool. Everything else from
+earlier drafts is discarded except the findings below, which both motivate and validate the
+design.
 
-## Environment
-
-From the uploaded client log:
-
-| Item | Value |
-|---|---|
-| RimWorld | 1.4.3542 rev627 |
-| Multiplayer mod | **0.7.0** (first 1.4 release; assembly 0.3.0, API 0.3) |
-| Connection | Steam relay |
-| Mods listed in the log | Harmony 2.2.2, Core, Multiplayer — no DLC, no other mods |
-
-Reported by the players as their actual mod list (both sides, same order):
-Prepatcher, Harmony, Core + DLC, OgreStack, Haul to Stack, Multiplayer, Pick Up And Haul.
-
-> **Unresolved discrepancy:** the uploaded log's loaded-mods section shows only
-> Harmony/Core/Multiplayer and no DLC, yet the log contains the desync events. Either this log
-> comes from a stripped-down test session (in which case: desyncs reproduce even in near-vanilla,
-> which is major evidence on its own), or from a different session than the one being described.
-> Resolving this is step 0 of the playbook below — it decides whether mod bisection is even a
-> priority.
-
-## What "Wrong random state on map 0" actually means
-
-It is not a placeholder and not (only) a generic message. Mechanically
-(`ClientSyncOpinion.CheckForDesync`, `SyncCoordinator`):
-
-- Every `Rand` call made during simulation pushes the post-call RNG state into a per-context
-  list: one list per map (keyed by real map id — `0` is the colony map), one for the world, one
-  for command execution.
-- Opinions (windows of a few ticks) are exchanged; the lists are compared **element by
-  element** (`SequenceEqual`). The message names the first *category* that mismatched, so "map 0"
-  means: the sequence of RNG states produced by map-0 simulation differed. All granularity beyond
-  that lives in the **trace hashes**: each RNG call also records a hashed stack trace, and
-  `FindTraceHashesDiffTick` computes `diffAt` — the index of the first call where the two sides
-  disagree.
-- The trace printed as "Trace of first desynced map random state" is what the *host* executed at
-  index `diffAt`. What the *client* executed at that same index is in `local_traces.txt` — and
-  that pair, host[diffAt] vs local[diffAt], is the closest thing to a smoking gun this system
-  produces.
-
-### Why the hive showing up does not (yet) implicate the hive
-
-The hive + 2 megaspiders existed since map start and tick constantly. `CompSpawnerFilth` rolls
-MTB randomness on a short interval, making the hive one of the highest-frequency RNG consumers on
-the map. When the two RNG streams shift relative to each other (one side made an extra or missing
-call anywhere), the first *observed* mismatch tends to land on whatever calls RNG most often —
-i.e. the hive is likely the **witness**, not the culprit. The culprit is whatever call appears on
-one side but not the other at/just before `diffAt`, which is exactly why the local traces are
-required.
-
-## Observed pattern (recap)
-
-- 12× `Wrong random state on map 0`, 1× `Wrong random state for the world`, 1× `Trace hashes
-  don't match`, spread over two sessions, roughly every 6k–100k ticks.
-- The final two desyncs happened **"after tick -1"**: the client desynced immediately after
-  rejoining, before a single comparison window validated — a desync loop. The state the host
-  serializes for rejoin already disagrees with the host's own live simulation, or the client's
-  load of it diverges instantly.
+Environment (from `Desync102.zip`): RimWorld 1.6.4871 rev591, Multiplayer `0.11.5+4a3be27-dirty`
+(a build of this repo's HEAD), 2 players, async time off, 1 map. Mods: Prepatcher, Harmony,
+Core + all DLC, OgreStack, Haul to Stack, Multiplayer, Pick Up And Haul.
 
 ---
 
-# Pinpointing playbook
+## Finding from Desync102: the divergent call, exactly
 
-Ordered so that each step either finds the cause or eliminates a whole class of causes. The
-guiding principle: the current detector compares **RNG streams**, which observe the *symptom* —
-divergence is only detected when the diverged state finally consumes randomness differently,
-possibly long after the actual split. The later steps therefore move from "where did the RNG
-streams split" to "where did the *game state* split", which is the innovative part.
+Diffing `local_traces.txt` against `host_traces.txt` (same zip) shows the two RNG streams are
+identical up to trace index 517 and shifted by exactly one call from index 518 on. At index 518,
+tick 1865619, the **host executed one extra main-stream RNG draw** the client never made:
 
-## Step 0 — Resolve the evidence discrepancy (minutes)
+```
+Rand.Bool <- Rand.Element<int>
+  <- Multiplayer.Client.SeedGrammar.Prefix            (Source/Client/Patches/Seeds.cs:176)
+  <- RimWorld.PawnBioAndNameGenerator.GeneratePawnName
+  <- Verse.Pawn_AgeTracker.CheckChangePawnKindName
+  <- Pawn_AgeTracker.RecalculateLifeStageIndex
+  <- Pawn_AgeTracker.CalculateGrowth
+  <- Pawn_AgeTracker.AgeTickInterval                   on 'Cow156958'
+```
 
-Confirm which session the uploaded log belongs to. Grab the newest `Desync-XX.zip` files from the
-`MpDesyncs` folder (both machines ideally). Each zip already contains:
+`Cow156958` changed life stage on that tick on both clients (the simulation itself was still in
+sync). Vanilla's `CheckChangePawnKindName` then decides whether to regenerate the animal's
+numeric name — a decision **gated on string comparison between the pawn's stored `Name` and the
+current translated kind label**. The host's gate said "rename" (consuming one RNG draw via the
+`SeedGrammar` advance); the client's gate said "nothing to do". One extra draw → every subsequent
+state in the stream differs → "Trace hashes don't match" / "Wrong random state" 21 ticks later.
 
-- `desync_info` — versions, async time, arbiter state, machine info for **both** interpretation
-  and config comparison
-- `local_traces.txt` **and** `host_traces.txt` — both sides of the divergence
-- `local_logs.txt`, jitted method lists, and (if enabled) `replay.rwmts`
+### Why the gate can differ while the simulation is identical
 
-If the mods list in those logs shows near-vanilla: desyncs reproduce without the hauling mods →
-skip Step 3's bisection and go straight to Steps 4–6.
+Pawn name strings are produced by grammar resolution using the **active language's** rule packs
+and labels, on each client independently (MP seeds the grammar RNG but cannot make different
+language data produce equal strings). Two consequences:
 
-## Step 1 — Diff both sides' traces at `diffAt` (hours, no code)
+1. In a session where players run different game languages (or differently complete
+   translations — the client's earlier logs showed *"Translation data for language Latin American
+   Spanish has 35 errors"*), animals get names like `Cow 5` on one side and `Vaca 5` on the
+   other, **silently baked into each side's game state** from the moment of naming.
+2. That latent string divergence is invisible to the RNG-stream detector — until vanilla code
+   *reads it back into a simulation decision*. `CheckChangePawnKindName` is exactly such a reader:
+   stored-name-vs-kind-label comparisons evaluate differently per side, so the RNG-consuming
+   rename fires on one side only. Every animal life-stage transition is a potential desync — which
+   matches the observed cadence (animal-heavy colony, desyncs every few in-game days, both
+   map-stream and world-stream hits, since world-pawn animals age too).
 
-Line up `local_traces.txt` and `host_traces.txt` by trace index and compare at and around the
-divergence. Outcomes:
+This is the archetype of the bug class the RNG detector fundamentally cannot localize: **state
+diverges quietly at time T, the desync fires at time T+n from an unrelated-looking callsite.**
+The trace diff caught this one because the read-back happens to consume RNG; a gate that instead
+altered, say, a stack count would surface thousands of ticks later, anywhere. Hence: state
+hashing.
 
-- **Extra call on one side** (e.g. client shows a `WorkGiver_HaulToInventory`/hauling frame the
-  host doesn't have): direct culprit identification.
-- **Same call, different RNG state already at entry**: the split happened *before* the window;
-  proceed to state-hashing (Step 5), because trace radius will never show the origin.
-- **Same calls, different thing ids**: object identity divergence (things created/destroyed in
-  different order earlier) — also a Step 5 case.
-
-Deliverable for the repo: a small `trace-diff` script/tool (parse both files, align indices,
-print first divergence with N frames of context from BOTH sides). Every future report becomes
-actionable in minutes instead of guesswork from one side.
-
-## Step 2 — Split the hypothesis space with same-machine runs (an evening, no code)
-
-The single most information-dense experiment available without touching code. Run **host + a
-second game instance joining from the same machine** (or host + arbiter — the arbiter is exactly
-this, built in: a headless instance simulating the same commands on the host's machine; visible
-in `desync_info` as "Arbiter Connected And Playing").
-
-- **Desyncs still occur same-machine** → hardware/OS differences are excluded; the cause is
-  genuine nondeterminism in code (mods, vanilla edge case, save/load asymmetry). Focus Steps 3–6.
-- **Same-machine never desyncs, cross-machine does** → focus on machine-environment divergence:
-  - **FP round-mode corruption**: some audio drivers/overlays flip the x87/SSE rounding mode,
-    silently changing float results. This was a real, historically confirmed desync cause — new
-    MP versions explicitly compare `RoundMode` between clients (see
-    `ClientSyncOpinion.CheckForDesync`'s "FP round mode doesn't match"); 0.7 predates that check,
-    so this cause is *invisible* on their version.
-  - **OS locale/culture**: the client machine runs a Spanish (LatAm) locale. Vanilla parses defs
-    culture-invariantly, but mods frequently `float.Parse` their settings without
-    `InvariantCulture` — identical settings *files* then yield different in-memory values
-    (`1.5` vs `15`) on machines with different decimal separators. Test: set both Windows
-    regions/formats identical and retest; audit the mod list for culture-sensitive parsing.
-  - CPU-specific float paths (denormals, FMA differences) — rarer; the arbiter/local test brackets
-    it.
-
-## Step 3 — Controlled mod bisection with accelerated repro (only if Step 0 implicates mods)
-
-The reported mod list contains three hauling/stacking mods — **Pick Up And Haul, Haul to Stack,
-OgreStack** — none of which are MP-aware natively. PUAH in particular is a historically notorious
-desync source (inventory-hauling decisions from per-instance caches). "Same mods on both sides"
-does **not** imply determinism: a mod can be internally nondeterministic on identical setups
-(unordered `Dictionary`/`HashSet` iteration, static `System.Random`, camera/UI-dependent caches,
-time-based logic).
-
-- First check: is **Multiplayer Compatibility** ("MP Compat") installed? It carries community
-  sync patches for many popular mods including hauling ones. If not: install on both sides,
-  retest before bisecting anything.
-- Bisect with a *time-compressed* protocol instead of hours of natural play: dev mode, max speed,
-  spawn large hauling workloads (many stacks + storage churn) to hammer the suspect code paths;
-  give each configuration a fixed tick budget (e.g. 300k ticks). Halve the mod set on each
-  desync-free budget.
-- Prepatcher note: it rewrites `Assembly-CSharp` itself. Verify both sides produce identical
-  patched assemblies (compare hashes of the patched output) — a one-sided patch difference is a
-  silent determinism killer that no mod-list comparison will catch.
-
-## Step 4 — Turn the desync zip's replay into a deterministic repro-in-a-box (code: small)
-
-`SaveableDesyncInfo` can embed `replay.rwmts` (enable `includeReplayInDesync`): the initial save
-plus the full command stream. A replay *must* produce identical simulation everywhere. So:
-
-- Run the same desync replay on both machines to completion, hashing state every N ticks.
-- If the two machines' replays diverge → machine-environment nondeterminism captured in a
-  shareable, re-runnable file: bisect *in the replay* (binary-search the tick of first hash
-  divergence) rather than in live play. No second player needed, infinitely repeatable.
-- If replays agree everywhere → the live desync came from something outside the recorded
-  command+save state (unsynced input, UI-side mutation, network-order effects), which is itself a
-  huge clue.
-
-This makes desyncs *offline-debuggable* — the biggest force multiplier of the plan.
-
-## Step 5 — Hierarchical map-state hashing: find the state split, not the RNG symptom (code: the innovative core)
-
-RNG-stream comparison can only see divergence when RNG is consumed. A quietly diverged stack
-count (very relevant for stack-modifying mods) can sit latent for thousands of ticks. Proposal —
-a debug-mode **Merkle-style state hasher**:
-
-1. Reuse `ExposeData`: implement a `ScribeSaver` variant that streams into a rolling hash instead
-   of XML ("hash mode Scribe"). Every savable object already enumerates its persistent state
-   deterministically — zero per-class work.
-2. Every N ticks compute hashes per subsystem: things (bucketed: pawns / items / buildings /
-   filth), reservations, jobs, lords, hediffs, zones, designations, plus the RNG state; combine
-   into per-map roots and a game root.
-3. Exchange only the root per window (a few bytes — cheaper than today's RNG state lists). On
-   mismatch, walk down the tree over the network: root → subsystem → bucket → individual thing →
-   full XML dump of that one object from both sides, field-diffed in the desync window.
-
-End result: desync reports change from *"Wrong random state on map 0"* to
-*"`Muffalo47101.inventory` stack count 75 vs 74"* — the actual first diverged state, named.
-Follow-up features enabled by it:
-
-- **Earliest-divergence bisection in time**: keep a ring buffer of periodic root hashes; on
-  desync, report the last tick roots matched — the true divergence onset, not the detection tick.
-- **Save/load asymmetry self-test** (targets the "after tick -1" rejoin loop directly): a dev
-  action on the host that saves the game, reloads it in memory (the rejoin path), and compares
-  state hash before vs after. If they differ, the rejoin desync loop is explained *on one
-  machine, in one click* — no second player, no network.
-
-## Step 6 — Full-fidelity RNG ledger (code: medium, complements Step 5)
-
-A "hunt mode" toggle that records **every** RNG call (tick, caller hash, `ThingContext` id/def,
-post-call state) into a bounded compressed ring buffer on both sides — the existing
-`DeferredStackTracing`/`StackTraceLogItemRaw` infrastructure already captures per-call context;
-this extends retention from the current ±`desyncTracesRadius` (default 40) window to hundreds of
-thousands of calls. On desync both sides dump the buffer; a machine diff finds the first
-divergent call even when it precedes the detection window by many ticks. Ship the dumps inside
-the existing `Desync-XX.zip`.
+> Immediate corollary (small, separate from the hasher work): MP should patch
+> `Pawn_AgeTracker.CheckChangePawnKindName` to isolate it (`Rand.PushState/PopState` around the
+> original, so the conditional rename consumes zero main-stream draws on either side). Names are
+> already per-language divergent by design; isolating the RNG makes that divergence harmless.
+> This fixes the identified desync regardless of the hasher timeline. A players-side workaround
+> exists meanwhile: run identical game languages on both sides.
 
 ---
 
-# Fix phases (updated)
+# The plan: Merkle state hashing
 
-1. **Alignment & quick wins:** update MP on both sides to the latest release for their RimWorld
-   version (0.7.0 predates years of desync fixes *and* the FP round-mode check); install MP
-   Compat; verify identical DLC sets and Prepatcher output; don't dismiss join-data warnings.
-2. **Run the playbook** (Steps 0–4 need little or no code) until a cause class is isolated.
-3. **Implement tooling** (trace-diff tool → replay divergence runner → state hasher → RNG ledger)
-   in this repo behind debug settings; they permanently upgrade every future desync report.
-4. **Fix the identified cause(s)** — sync patches for the offending mod paths (contribute to MP
-   Compat where the culprit is a third-party mod), or determinism/serialization fixes here if
-   vanilla-or-MP code is at fault.
-5. **Break the rejoin loop** regardless of root cause: when a desync fires with
-   `lastValidTick == -1` immediately after a rejoin, retrying the client-only rejoin from the same
-   host state cannot succeed — detect it and escalate to a full host save+reload so all parties
-   resynchronize from identical serialized state.
+## Goal
+
+Replace "Wrong random state on map 0" with *"`Thing Cow156958` field `name`: `Cow 5` vs
+`Vaca 5`, first diverged ≤ tick 1863000"* — automatically, in the desync report, for any state
+divergence, without needing a reproduction.
+
+## Core design
+
+### 1. HashScribe — hashing through the existing save pipeline
+
+Every persistent object already enumerates its state deterministically via `ExposeData`. Reuse
+it wholesale: run the Scribe saving pipeline with a **hashing writer** instead of an XML
+document builder.
+
+- Implementation point: the `ScribeSaver` writes through an `XmlWriter`. Provide a
+  `HashingXmlWriter : XmlWriter` that maintains a stack of running hash contexts (xxHash64 or
+  similar non-crypto, allocation-free): `WriteStartElement` pushes a child context,
+  `WriteString`/attributes feed it, `WriteEndElement` folds the child digest into the parent and
+  — at configurable depth — records `(element path → digest)` into a bounded table.
+- Zero per-class work, zero behavior change to saving; anything `ExposeData` covers is covered.
+  MP already drives Scribe directly (`ScribeUtil`), so the plumbing precedent exists.
+- Depth-limited digest recording keeps memory bounded: record digests for levels
+  *game → world/map → subsystem → individual thing/component*; below thing level, digests fold
+  into the thing digest without being stored (recomputed on demand during drill-down).
+
+### 2. What gets hashed, at what granularity
+
+Per map: each `Thing` (via its `ExposeData`, bucketed by def category), map components
+(reservations, lords, zones, areas, designations, haul destinations, wealth), pawn subtrees
+(needs, health, jobs, inventory — these come free as nested elements of the pawn's digest).
+Per world: factions, world pawns, ideos, world objects. Plus the RNG state itself as one leaf.
+
+Caveats learned from the codebase:
+
+- **Save-compression must be disabled in hash mode** (`CompressibilityDeciderUtility` /
+  `SaveCompressiblePatch`): compressible things (rock, filth) must hash per-thing or at least
+  per-grid-chunk, not as one opaque string, to keep drill-down useful.
+- **Derived/cached state must not be hashed** — only what `ExposeData` persists. This falls out
+  of the design for free and is why reusing Scribe beats reflection-walking objects.
+- **Collection order**: `ExposeData` output order is deterministic given identical state; things
+  themselves are iterated in a fixed order (spawn/register order). Order divergence is itself
+  state divergence — the hasher correctly reports it rather than masking it.
+
+### 3. Two channels: sim-critical vs cosmetic (design constraint proven by the Cow156958 finding)
+
+Some state is **legitimately different across peers**: grammar-generated strings in the active
+language (pawn names, art descriptions, battle-log/tale text). Raw whole-state hashing would
+flag these instantly and permanently ("everything differs, always").
+
+- Maintain a small **field-level exclusion registry** (element-path patterns, e.g.
+  `.../name/*`, tale/battle-log text nodes) whose contents hash into a separate **cosmetic
+  channel** instead of the sim-critical channel.
+- Sim-critical channel mismatch ⇒ desync-grade event with drill-down.
+- Cosmetic channel mismatch ⇒ *report-only* diagnostic in the desync info.
+
+Note the payoff on the actual bug found: the cosmetic channel would have listed
+`Cow156958.name: 'Cow 5' vs 'Vaca 5'` on the very first exchange — the root cause, printed
+before the desync even fired. And the registry doubles as a **hit-list of vanilla code that must
+never read cosmetic state into simulation decisions** — each entry is a place needing a
+`CheckChangePawnKindName`-style isolation patch.
+
+### 4. Exchange & drill-down protocol
+
+- Every N ticks (hunt mode: ~600; always-on mode later: ~2500), each client computes the tree
+  and appends the two root digests (sim, cosmetic) to its `ClientSyncOpinion`
+  (serialization versioned; a few bytes per window on top of the existing RNG state lists).
+- `SyncCoordinator.AddClientOpinionAndCheckDesync` compares roots along with today's checks.
+- On sim-root mismatch: a new packet pair — `StateHashNodeRequest(path)` /
+  `StateHashNodeResponse(children: name→digest)` — walks the tree from the root: subsystem →
+  bucket → thing (log-time descent, a handful of round trips). At the leaf, both sides
+  serialize the offending object to XML (normal Scribe) and send it; the desync window and
+  the `Desync-XX.zip` gain a `state_diff.txt` with a field-level diff.
+- The last matching exchange tick bounds the divergence onset: report
+  *"states equal at tick A, diverged by tick B"* — ending the detected-at vs diverged-at gap.
+
+### 5. Performance strategy
+
+- **Hunt mode first** (opt-in, both clients): full-map hash every ~600 ticks. Reference point:
+  full XML save of their map took ~300 ms in logs; hashing skips string/DOM/IO work, so the
+  budget is tens of ms per pass, acceptable while actively hunting.
+- Amortization for always-on mode (phase 2): hash 1/K of the thing buckets per tick over a
+  K-tick window (each bucket still hashed at its own fixed tick, so windows are comparable),
+  map components every window. Only pursue after hunt mode proves value.
+- Everything runs on the main thread at a deterministic tick boundary (RimWorld state is not
+  safely readable off-thread); the budget math above is what makes that viable.
+
+### 6. Repo layout & integration points
+
+```
+Source/Client/Desyncs/StateHashing/
+    HashingXmlWriter.cs      // XmlWriter -> Merkle hash stack
+    StateHasher.cs           // orchestrates Scribe pass, tree assembly, channels
+    StateHashRegistry.cs     // cosmetic-channel exclusion patterns
+    StateHashComparer.cs     // drill-down client logic + diff rendering
+Source/Common/Networking/Packet/   // StateHashNodeRequest/Response packets
+```
+
+Integrations: `ClientSyncOpinion` (roots + serialization), `SyncCoordinator` (comparison),
+`SaveableDesyncInfo` (`state_diff.txt` in the zip), `MpSettings` (hunt-mode toggle, interval),
+`DesyncedWindow` (show the field diff).
+
+## Milestones
+
+| # | Deliverable | Exit criterion |
+|---|---|---|
+| M1 | `HashingXmlWriter` + `StateHasher`, local only | Same-process determinism: hashing twice in a row without ticking ⇒ identical tree. **Save→load→hash round-trip ⇒ identical tree** (this test alone also detects save/load asymmetry, the historic "desync after tick -1" loop class). Tests in `Source/Tests`. |
+| M2 | Roots in `ClientSyncOpinion` + comparison in `SyncCoordinator`, hunt-mode setting | Two clients in sync report equal roots for 100k+ ticks; a dev-mode injected state mutation on one side trips the root within one window. |
+| M3 | Drill-down protocol + `state_diff.txt` | Injected mutation is pinpointed to the exact thing and field in the desync zip without human digging. |
+| M4 | Cosmetic channel + exclusion registry | Cross-language session (host English, client Spanish) runs with **zero false sim-channel trips**, while the cosmetic report lists the name-string divergences. |
+| M5 | Acceptance test on the real bug | Reproduce Desync102's scenario (aging numeric-named animal, different languages): hasher must name the pawn's `name` field *before* the RNG desync fires. Ship the `CheckChangePawnKindName` isolation patch; hasher confirms sessions stay clean after it. |
+
+## Risks / open questions
+
+- **Scribe re-entrancy**: hash passes must not disturb `Scribe.mode`/cross-ref state used by the
+  real saver; run only at tick boundaries outside autosaves (MP already disables the vanilla
+  autosaver — `DisableAutosaver` — and controls save timing, which helps).
+- **DLC/mod ExposeData nondeterminism**: a mod whose `ExposeData` itself iterates an unordered
+  collection will look "divergent" every pass even against itself — the M1 same-process
+  determinism test catches this per-mod, and such a finding is itself a desync culprit lead
+  (their save output is nondeterministic too).
+- **Hash-mode Scribe fidelity**: `ExposeData` can behave differently when `Scribe.mode !=
+  Saving`… it *is* Saving here, just with a different writer, so fidelity risk is low; the
+  round-trip test in M1 is the guard.
+- **Bandwidth** of drill-down XML dumps: bounded (one object, on desync only).
