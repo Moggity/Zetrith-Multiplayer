@@ -11,6 +11,7 @@ using System.Text;
 using HarmonyLib;
 using LudeonTK;
 using Multiplayer.Client.Desyncs;
+using Multiplayer.Client.Desyncs.StateHashing;
 using Multiplayer.Client.Util;
 using Multiplayer.Client.Windows;
 using RimWorld;
@@ -253,6 +254,70 @@ namespace Multiplayer.Client
         public static void ShowPendingPlayer()
         {
             PendingPlayerWindow.EnqueueJoinRequest(SteamUser.GetSteamID(), (_, _) => { });
+        }
+
+        [DebugAction(MultiplayerLocalCategory, name = "State hash: determinism check", allowedGameStates = AllowedGameStates.Playing)]
+        public static void StateHashDeterminismCheck()
+        {
+            // Hashing the same state twice must produce identical trees. A mismatch means some
+            // ExposeData produces nondeterministic output (e.g. iterates an unordered collection),
+            // which breaks both state hashing and save determinism - and is a desync culprit lead.
+            var timer = Stopwatch.StartNew();
+            var first = StateHasher.HashGame();
+            var firstMs = timer.ElapsedMilliseconds;
+
+            timer.Restart();
+            var second = StateHasher.HashGame();
+            var secondMs = timer.ElapsedMilliseconds;
+
+            Log.Message($"State hash: {first.Nodes.Count} nodes (+{first.CosmeticNodes.Count} cosmetic), " +
+                        $"sim root {first.SimRoot:X16}, cosmetic root {first.CosmeticRoot:X16}, " +
+                        $"took {firstMs}ms/{secondMs}ms");
+
+            if (first.SimRoot == second.SimRoot && first.CosmeticRoot == second.CosmeticRoot)
+            {
+                Log.Message("State hash: deterministic, both passes match");
+                return;
+            }
+
+            Log.Error("State hash: NOT deterministic between two passes over the same state!");
+            int count = Math.Min(first.Nodes.Count, second.Nodes.Count);
+            for (int i = 0; i < count; i++)
+            {
+                if (first.Nodes[i].Digest != second.Nodes[i].Digest || first.Nodes[i].Path != second.Nodes[i].Path)
+                {
+                    Log.Error($"State hash: first difference at node {i}: " +
+                              $"{first.Nodes[i].Path} ({first.Nodes[i].Digest:X16}) vs " +
+                              $"{second.Nodes[i].Path} ({second.Nodes[i].Digest:X16})");
+                    return;
+                }
+            }
+            Log.Error($"State hash: node lists differ in length: {first.Nodes.Count} vs {second.Nodes.Count}");
+        }
+
+        [DebugAction(MultiplayerLocalCategory, name = "State hash: dump digests", allowedGameStates = AllowedGameStates.Playing)]
+        public static void StateHashDump()
+        {
+            // Both players pause at the same tick and run this; diffing the two files pinpoints
+            // diverged state down to individual things without waiting for a desync.
+            var result = StateHasher.HashGame();
+            var builder = new StringBuilder();
+
+            builder.AppendLine($"Tick: {TickPatch.Timer}")
+                .AppendLine($"Sim root: {result.SimRoot:X16}")
+                .AppendLine($"Cosmetic root: {result.CosmeticRoot:X16}")
+                .AppendLine()
+                .AppendLine("=== Sim nodes ===");
+            foreach (var node in result.Nodes)
+                builder.AppendLine($"{node.Path} {node.Digest:X16}");
+
+            builder.AppendLine().AppendLine("=== Cosmetic nodes ===");
+            foreach (var node in result.CosmeticNodes)
+                builder.AppendLine($"{node.Path} {node.Digest:X16}");
+
+            var file = $"state_hash_{Multiplayer.username}_{TickPatch.Timer}.txt";
+            File.WriteAllText(file, builder.ToString());
+            Log.Message($"State hash: dumped {result.Nodes.Count} nodes (+{result.CosmeticNodes.Count} cosmetic) to {file}");
         }
 
         [DebugAction(MultiplayerCategory, "Dump Sync Types", allowedGameStates = AllowedGameStates.Entry)]
