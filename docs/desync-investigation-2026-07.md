@@ -226,6 +226,15 @@ Integrations: `ClientSyncOpinion` (roots + serialization), `SyncCoordinator` (co
 
 ## Milestones
 
+Status: the `CheckChangePawnKindName` isolation patch has shipped
+(`Source/Client/Patches/Determinism.cs`, `IsolateChangePawnKindNameRandState`). M1 is
+implemented: `HashingXmlWriter` (`Source/Common/StateHashing/`), `StateHasher`
+(`Source/Client/Desyncs/StateHashing/`), unit tests (`Source/Tests/HashingXmlWriterTest.cs`),
+and two dev-mode actions under *Multiplayer local* — "State hash: determinism check"
+(double-hash self-test) and "State hash: dump digests" (both players pause at the same tick,
+dump, and diff the two files to pinpoint diverged things manually, ahead of the M2/M3 network
+protocol).
+
 | # | Deliverable | Exit criterion |
 |---|---|---|
 | M1 | `HashingXmlWriter` + `StateHasher`, local only | Same-process determinism: hashing twice in a row without ticking ⇒ identical tree. **Save→load→hash round-trip ⇒ identical tree** (this test alone also detects save/load asymmetry, the historic "desync after tick -1" loop class). Tests in `Source/Tests`. |

@@ -750,5 +750,27 @@ namespace Multiplayer.Client.Patches
             Multiplayer.Client != null ? length : UnityData.GetIdealBatchCount(length);
     }
 
+    // CheckChangePawnKindName decides whether to regenerate an animal's numeric name by comparing
+    // the stored name against the current (translated) kind label. Name strings are generated from
+    // each client's language data, so the comparison can go differently on clients running different
+    // languages (or different versions of the same community translation), making the RNG draw
+    // inside GeneratePawnName one-sided. Isolate the whole method's RNG usage so a one-sided rename
+    // can't shift the synced random state stream. The resulting name strings still differ per
+    // language, but nothing else in the simulation reads them.
+    [HarmonyPatch(typeof(Pawn_AgeTracker), nameof(Pawn_AgeTracker.CheckChangePawnKindName))]
+    static class IsolateChangePawnKindNameRandState
+    {
+        static void Prefix(ref bool __state)
+        {
+            if (Multiplayer.Client == null) return;
+            Rand.PushState();
+            __state = true;
+        }
 
+        static void Finalizer(bool __state)
+        {
+            if (__state)
+                Rand.PopState();
+        }
+    }
 }
